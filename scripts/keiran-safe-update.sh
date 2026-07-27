@@ -20,6 +20,13 @@
 #   HERMES_SAFE_UPDATE_PYTHON   interpreter to introspect (default: <repo>/venv/bin/python)
 #   HERMES_SAFE_UPDATE_HERMES   hermes entrypoint (default: PATH, then <repo>/venv/bin/hermes)
 #   HERMES_SAFE_UPDATE_TIMEOUT  gateway readiness timeout in seconds (default: 240)
+#   HERMES_SAFE_UPDATE_EXPECT   comma-separated platforms that must be connected and
+#                               fresh after the restart. Set this when the caller
+#                               already stopped the gateway: the auto-detected set is
+#                               read from gateway_state.json, and a stopped gateway has
+#                               marked its own platforms disconnected, so auto-detection
+#                               sees only platforms this host does not actually run.
+#                               Use "none" to assert that no platform is expected.
 #
 # Exit codes: 0 ok · 1 runtime failure (snapshot kept) · 2 precondition refusal · 64 usage.
 set -euo pipefail
@@ -31,6 +38,7 @@ EXPECTED_UPSTREAM="NousResearch/hermes-agent"
 SNAP_DIR="$HERMES_HOME/backups/lazy-features"
 STATE_FILE="$HERMES_HOME/gateway_state.json"
 READY_TIMEOUT="${HERMES_SAFE_UPDATE_TIMEOUT:-240}"
+EXPECT_PLATFORMS="${HERMES_SAFE_UPDATE_EXPECT:-}"
 UNITS=(hermes-gateway.service hermes-serve.service)
 
 MODE="update"
@@ -260,9 +268,17 @@ main() {
   take_snapshot
 
   local gw_start live
-  gw_start="$(unit_start_epoch hermes-gateway.service)"
-  live="$("$PYTHON" -c "$PY_LIVE" "$STATE_FILE" "$gw_start")"
-  say "live platforms before update: ${live:-<none>}"
+  if [ -n "$EXPECT_PLATFORMS" ]; then
+    live="$([ "$EXPECT_PLATFORMS" = "none" ] && printf '' || printf '%s' "$EXPECT_PLATFORMS")"
+    say "expected platforms after update (HERMES_SAFE_UPDATE_EXPECT): ${live:-<none>}"
+  else
+    gw_start="$(unit_start_epoch hermes-gateway.service)"
+    live="$("$PYTHON" -c "$PY_LIVE" "$STATE_FILE" "$gw_start")"
+    say "live platforms before update: ${live:-<none>}"
+    if [ -z "$live" ] && ! systemctl --user is-active --quiet hermes-gateway.service; then
+      warn "gateway is already stopped, so no platform reports as live — the readiness gate will assert nothing. Pass HERMES_SAFE_UPDATE_EXPECT=<platforms> to verify the restart."
+    fi
+  fi
 
   if [ "$DRY_RUN" = "1" ]; then
     say "dry run — reporting the restore plan; no update, no restart"

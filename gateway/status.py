@@ -990,6 +990,18 @@ def write_runtime_status(
     payload = _read_json_file(path) or _build_runtime_status_record()
     current_record = _build_pid_record()
     payload.setdefault("platforms", {})
+    # Platform health belongs to the process that reported it. When the status
+    # file was last written by a *different* gateway process, drop the
+    # inherited map instead of merging into it: shutdown only flips the
+    # platforms the dying process owned, so a platform this boot no longer runs
+    # (plugin disabled, credentials removed) keeps its last "connected" entry
+    # forever and readiness probes then wait on a platform that can never
+    # report again.
+    if payload["platforms"] and (
+        payload.get("pid") != current_record["pid"]
+        or payload.get("start_time") != current_record["start_time"]
+    ):
+        payload["platforms"] = {}
     payload["kind"] = current_record["kind"]
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]

@@ -461,6 +461,49 @@ class TestGatewayRuntimeStatus:
         assert payload["pid"] == os.getpid()
         assert payload["start_time"] == 2000
 
+    def test_write_runtime_status_drops_platforms_from_a_previous_process(
+        self, tmp_path, monkeypatch
+    ):
+        """A platform this boot does not run must not inherit 'connected'.
+
+        Shutdown only flips the platforms the dying process owned, so a
+        platform that was dropped from the config keeps its last connected
+        entry and readiness probes wait forever on a platform that can never
+        report again.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 2000)
+
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 1000.0,
+            "kind": "hermes-gateway",
+            "platforms": {
+                "telegram": {"state": "disconnected", "updated_at": "2025-01-01T00:00:00Z"},
+                "feishu": {"state": "connected", "updated_at": "2025-01-01T00:00:00Z"},
+            },
+            "updated_at": "2025-01-01T00:00:00Z",
+        }))
+
+        status.write_runtime_status(gateway_state="starting")
+
+        assert status.read_runtime_status()["platforms"] == {}
+
+    def test_write_runtime_status_keeps_platforms_within_the_same_process(
+        self, tmp_path, monkeypatch
+    ):
+        """Pruning is scoped to a process change, not to every write."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 2000)
+
+        status.write_runtime_status(gateway_state="starting")
+        status.write_runtime_status(platform="telegram", platform_state="connected")
+        status.write_runtime_status(gateway_state="running")
+
+        platforms = status.read_runtime_status()["platforms"]
+        assert platforms["telegram"]["state"] == "connected"
+
     def test_runtime_status_running_pid_rejects_stale_record_for_supervisor_pid(self, monkeypatch):
         """Regression: stale profile runtime state must not mark s6 supervisors live.
 
