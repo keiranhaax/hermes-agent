@@ -249,6 +249,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "SIGNAL_GROUP_ALLOWED_USERS",
     "EMAIL_ALLOWED_USERS",
     "SMS_ALLOWED_USERS",
+    "PHOTON_ALLOWED_USERS",
     "MATTERMOST_ALLOWED_USERS",
     "MATRIX_ALLOWED_USERS",
     "DINGTALK_ALLOWED_USERS",
@@ -263,6 +264,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "SIGNAL_ALLOW_ALL_USERS",
     "EMAIL_ALLOW_ALL_USERS",
     "SMS_ALLOW_ALL_USERS",
+    "PHOTON_ALLOW_ALL_USERS",
     # Gateway home channels are set by /sethome in real profiles. Tests that
     # exercise dashboard notification toggles must opt in explicitly or they
     # can accidentally subscribe against a developer's real home channel.
@@ -303,6 +305,9 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "WECOM_HOME_CHANNEL",
     "WECOM_HOME_CHANNEL_THREAD_ID",
     "WECOM_HOME_CHANNEL_NAME",
+    "PHOTON_HOME_CHANNEL",
+    "PHOTON_HOME_CHANNEL_THREAD_ID",
+    "PHOTON_HOME_CHANNEL_NAME",
     # API server bind/auth settings are common in local gateway profiles and
     # change adapter defaults plus load_gateway_config() enablement. Tests that
     # need them set opt in explicitly with monkeypatch.
@@ -333,6 +338,25 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "WHATSAPP_REQUIRE_MENTION",
     "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
+    # Photon plugin state can be loaded during test collection. Clear every
+    # non-secret runtime knob so a developer's real shared line, home target,
+    # or sidecar settings cannot influence later tests in the same process.
+    "PHOTON_PROJECT_ID",
+    "PHOTON_SIDECAR_PORT",
+    "PHOTON_SIDECAR_AUTOSTART",
+    "PHOTON_NODE_BIN",
+    "PHOTON_DASHBOARD_HOST",
+    "PHOTON_SPECTRUM_HOST",
+    "PHOTON_REQUIRE_MENTION",
+    "PHOTON_MENTION_PATTERNS",
+    "PHOTON_TELEMETRY",
+    "PHOTON_MAX_INLINE_ATTACHMENT_BYTES",
+    "PHOTON_MAX_FETCH_ATTACHMENT_BYTES",
+    "PHOTON_MARKDOWN",
+    "PHOTON_REACTIONS",
+    "PHOTON_SEND_READ_RECEIPTS",
+    "PHOTON_STREAM_DEGRADED_RESTART_MS",
+    "PHOTON_STREAM_INTERRUPTED_DEGRADE_COUNT",
 })
 
 

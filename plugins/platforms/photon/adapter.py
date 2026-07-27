@@ -38,6 +38,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import unquote, urlparse
 
 if TYPE_CHECKING:
     # Type checkers see ``httpx`` as the always-imported module, so every use
@@ -77,6 +78,13 @@ _DEFAULT_SIDECAR_BIND = "127.0.0.1"
 # limit, but the underlying iMessage protocol limits practical message
 # size to ~16 KB.  Keep a conservative cap that matches BlueBubbles.
 _MAX_MESSAGE_LENGTH = 8000
+_MAX_FETCH_ATTACHMENT_BYTES = 100 * 1024 * 1024
+try:
+    _MAX_FETCH_ATTACHMENT_BYTES = max(
+        1, int(os.getenv("PHOTON_MAX_FETCH_ATTACHMENT_BYTES", ""))
+    )
+except (TypeError, ValueError):
+    pass
 
 # Dedup parameters — the gRPC stream is at-least-once, and a sidecar
 # reconnect can replay, so keep at least 1k ids for ~48h.
@@ -109,6 +117,52 @@ _PHOTON_RETRYABLE_PATTERNS = (
 # upstream gRPC pressure during Photon overflow events.
 _TYPING_COOLDOWN_SECONDS = 5.0
 
+
+class PhotonSidecarError(RuntimeError):
+    """Sanitized machine-readable failure returned by the local sidecar."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        operation_id: Optional[str] = None,
+    ) -> None:
+        self.code = code or "internal_error"
+        self.retryable = bool(retryable)
+        self.operation_id = operation_id
+        super().__init__(message or "Photon could not complete the operation.")
+
+
+def _photon_error_kind(code: str) -> str:
+    return {
+        "target_not_allowed": "forbidden",
+        "managed_line_target": "bad_format",
+        "quota_exceeded": "rate_limited",
+        "not_found": "not_found",
+        "unsupported": "bad_format",
+        "auth_failed": "forbidden",
+        "upstream_unavailable": "transient",
+        "invalid_request": "bad_format",
+        "attachment_too_large": "too_long",
+    }.get(code, "unknown")
+
+
+def _failed_send(exc: Exception) -> SendResult:
+    if isinstance(exc, PhotonSidecarError):
+        details = {"photon_error_code": exc.code}
+        if exc.operation_id:
+            details["photon_operation_id"] = exc.operation_id
+        return SendResult(
+            success=False,
+            error=str(exc),
+            retryable=exc.retryable,
+            error_kind=_photon_error_kind(exc.code),
+            raw_response=details,
+        )
+    return SendResult(success=False, error=str(exc), error_kind="unknown")
+
 # Group-chat mention wake words. When ``require_mention`` is enabled, group
 # messages are ignored unless they match one of these patterns — same
 # behavior and defaults as the BlueBubbles iMessage channel so the two
@@ -133,7 +187,21 @@ def check_requirements() -> bool:
     """Return True when both Python deps and the Node sidecar are available."""
     if not HTTPX_AVAILABLE:
         return False
-    if not shutil.which(os.getenv("PHOTON_NODE_BIN") or "node"):
+    node = shutil.which(os.getenv("PHOTON_NODE_BIN") or "node")
+    if not node:
+        return False
+    try:
+        version = subprocess.run(
+            [node, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        ).stdout.strip().lstrip("v")
+        major, minor, patch = (int(part) for part in version.split(".")[:3])
+        if (major, minor, patch) < (20, 18, 1):
+            return False
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return False
     if not (_SIDECAR_DIR / "node_modules").exists():
         # spectrum-ts not installed yet — `hermes photon setup` will
@@ -141,6 +209,12 @@ def check_requirements() -> bool:
         # surfaces the missing-deps state in `hermes setup` / status.
         return False
     return True
+
+
+def check_tool_requirements() -> bool:
+    """Expose Photon agent tools only after the platform is configured."""
+    project_id, project_secret = load_project_credentials()
+    return check_requirements() and bool(project_id and project_secret)
 
 
 def _sidecar_deps_stale() -> bool:
@@ -244,7 +318,13 @@ def _env_enablement() -> Optional[dict]:
     project_id, project_secret = load_project_credentials()
     if not (project_id and project_secret):
         return None
-    seed: dict = {"project_id": project_id, "project_secret": project_secret}
+    seed: dict = {
+        "project_id": project_id,
+        "project_secret": project_secret,
+        # Shared-line recipients must initiate before proactive sends are
+        # allowed, so restart pings are noisy failures by default.
+        "gateway_restart_notification": False,
+    }
     home = os.getenv("PHOTON_HOME_CHANNEL", "").strip()
     if home:
         seed["home_channel"] = {
@@ -252,6 +332,21 @@ def _env_enablement() -> Optional[dict]:
             "name": os.getenv("PHOTON_HOME_CHANNEL_NAME", "Home"),
         }
     return seed
+
+
+def _apply_yaml_config(
+    _yaml_cfg: Dict[str, Any], platform_cfg: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Bridge Photon-owned YAML settings into ``PlatformConfig.extra``."""
+    bridged = {
+        key: platform_cfg[key]
+        for key in ("reactions", "send_read_receipts", "mini_app")
+        if key in platform_cfg
+    }
+    bridged["gateway_restart_notification"] = platform_cfg.get(
+        "gateway_restart_notification", False
+    )
+    return bridged
 
 
 def _markdown_enabled() -> bool:
@@ -278,6 +373,8 @@ class PhotonAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = _MAX_MESSAGE_LENGTH
+    MAX_STREAMING_EDITS_PER_MESSAGE = 5
+    SUPPORTS_MESSAGE_EDITING = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("photon"))
@@ -339,6 +436,7 @@ class PhotonAdapter(BasePlatformAdapter):
         self._last_inbound_by_chat: Dict[str, str] = {}
         # Last time we sent a typing indicator per chat, for cooldown gating.
         self._typing_last_sent: Dict[str, float] = {}
+        self._contact_card_last_sent: Dict[str, float] = {}
 
         # Group-chat mention gating (parity with BlueBubbles). When enabled,
         # group messages are ignored unless they match a wake word; DMs are
@@ -353,6 +451,26 @@ class PhotonAdapter(BasePlatformAdapter):
             extra["mention_patterns"]
             if "mention_patterns" in extra
             else os.getenv("PHOTON_MENTION_PATTERNS")
+        )
+
+        # iMessage delivery signals. Environment variables override config.
+        # Reactions remain opt-in because a tapback on every prompt is noisy;
+        # read receipts default on, matching ordinary iMessage expectations.
+        reactions = os.getenv("PHOTON_REACTIONS")
+        if reactions is None:
+            reactions = extra.get("reactions", False)
+        self._automatic_reactions = str(reactions).strip().lower() in {
+            "true", "1", "yes", "on",
+        }
+        read_receipts = os.getenv("PHOTON_SEND_READ_RECEIPTS")
+        if read_receipts is None:
+            read_receipts = extra.get("send_read_receipts", True)
+        self._send_read_receipts = str(read_receipts).strip().lower() in {
+            "true", "1", "yes", "on",
+        }
+        mini_app = extra.get("mini_app")
+        self._mini_app_config: Dict[str, Any] = (
+            dict(mini_app) if isinstance(mini_app, dict) else {}
         )
 
     # -- Group-mention gating (parity with BlueBubbles) -------------------
@@ -655,6 +773,11 @@ class PhotonAdapter(BasePlatformAdapter):
         # iMessage spaces carry their type directly — no id string-sniffing.
         chat_type = "group" if space.get("type") == "group" else "dm"
         sender_id = sender.get("id") or space.get("phone") or space_id
+        chat_name = (
+            str(sender_id)
+            if chat_type == "dm"
+            else str(space.get("name") or "iMessage group")
+        )
 
         ts_str = event.get("timestamp") or ""
         try:
@@ -671,7 +794,7 @@ class PhotonAdapter(BasePlatformAdapter):
         media_urls: List[str] = []
         media_types: List[str] = []
 
-        def _normalize_binary_payload(
+        async def _normalize_binary_payload(
             payload: Dict[str, Any]
         ) -> tuple[str, MessageType, List[str], List[str]]:
             is_voice = payload.get("type") == "voice"
@@ -681,6 +804,12 @@ class PhotonAdapter(BasePlatformAdapter):
             cached = _cache_inbound_attachment(
                 payload, name, mime, force_audio=is_voice
             )
+            if not cached and payload.get("id"):
+                cached = await self._fetch_attachment(
+                    str(payload["id"]),
+                    phone=space.get("phone") or None,
+                    fallback_name=str(name),
+                )
             if cached:
                 return (
                     "(voice)" if is_voice else "(attachment)",
@@ -721,7 +850,7 @@ class PhotonAdapter(BasePlatformAdapter):
             emoji = content.get("emoji") or ""
             source = self.build_source(
                 chat_id=space_id,
-                chat_name=space_id,
+                chat_name=chat_name,
                 chat_type=chat_type,
                 user_id=sender_id,
                 user_name=sender_id or None,
@@ -756,7 +885,7 @@ class PhotonAdapter(BasePlatformAdapter):
             text = content.get("text") or ""
             mtype = MessageType.TEXT
         elif ctype in {"attachment", "voice"}:
-            text, mtype, media_urls, media_types = _normalize_binary_payload(content)
+            text, mtype, media_urls, media_types = await _normalize_binary_payload(content)
         elif ctype == "group":
             text_parts: List[str] = []
             mtype = MessageType.TEXT
@@ -773,7 +902,7 @@ class PhotonAdapter(BasePlatformAdapter):
                         text_parts.append(item_text)
                     continue
                 if item_type in {"attachment", "voice"}:
-                    marker, item_mtype, item_urls, item_types = _normalize_binary_payload(
+                    marker, item_mtype, item_urls, item_types = await _normalize_binary_payload(
                         item_content
                     )
                     if mtype == MessageType.TEXT:
@@ -809,7 +938,7 @@ class PhotonAdapter(BasePlatformAdapter):
 
         source = self.build_source(
             chat_id=space_id,
-            chat_name=space_id,
+            chat_name=chat_name,
             chat_type=chat_type,
             user_id=sender_id,
             user_name=sender_id or None,
@@ -824,6 +953,16 @@ class PhotonAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
         )
+        authorized = self._is_sender_authorized(sender_id, chat_type, space_id)
+        if self._send_read_receipts and authorized is True:
+            task = asyncio.create_task(
+                self._mark_read(space_id, event.get("messageId"))
+            )
+            try:
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            except TypeError:
+                pass
         await self.handle_message(message_event)
 
     # -- Sidecar lifecycle -------------------------------------------------
@@ -1104,7 +1243,9 @@ class PhotonAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self._sidecar_send(chat_id, self.format_message(content))
+        return await self._sidecar_send(
+            chat_id, self.format_message(content), reply_to=reply_to
+        )
 
     # -- Outbound media (parity with the BlueBubbles iMessage channel) -----
     #
@@ -1130,7 +1271,7 @@ class PhotonAdapter(BasePlatformAdapter):
             # Couldn't fetch the URL — fall back to sending it as text.
             return await super().send_image(chat_id, image_url, caption, reply_to)
         return await self._sidecar_send_attachment(
-            chat_id, local_path, caption=caption,
+            chat_id, local_path, caption=caption, reply_to=reply_to,
         )
 
     async def send_image_file(
@@ -1143,7 +1284,7 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, image_path, caption=caption,
+            chat_id, image_path, caption=caption, reply_to=reply_to,
         )
 
     async def send_voice(
@@ -1156,7 +1297,7 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, audio_path, caption=caption, kind="voice",
+            chat_id, audio_path, caption=caption, kind="voice", reply_to=reply_to,
         )
 
     async def send_video(
@@ -1169,7 +1310,7 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, video_path, caption=caption,
+            chat_id, video_path, caption=caption, reply_to=reply_to,
         )
 
     async def send_document(
@@ -1183,8 +1324,172 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, file_path, name=file_name, caption=caption,
+            chat_id, file_path, name=file_name, caption=caption, reply_to=reply_to,
         )
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit an outbound iMessage so gateway token streaming stays in place."""
+        try:
+            data = await self._sidecar_call(
+                "/edit",
+                {
+                    "spaceId": chat_id,
+                    "messageId": message_id,
+                    # Spectrum iMessage edits accept text only, not markdown.
+                    "text": strip_markdown(content),
+                },
+            )
+        except Exception as exc:
+            return _failed_send(exc)
+        return SendResult(
+            success=True,
+            message_id=data.get("messageId") or message_id,
+        )
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Unsend a recent outbound iMessage (subject to Apple's time window)."""
+        try:
+            await self._sidecar_call(
+                "/unsend", {"spaceId": chat_id, "messageId": message_id}
+            )
+            return True
+        except Exception as exc:
+            logger.debug("[photon] unsend failed: %s", exc)
+            return False
+
+    async def send_effect(
+        self,
+        chat_id: str,
+        text: str,
+        effect: str,
+        *,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        body: Dict[str, Any] = {
+            "spaceId": chat_id,
+            "text": text,
+            "effect": effect,
+            "format": "markdown" if _markdown_enabled() else "text",
+        }
+        if reply_to:
+            body["replyTo"] = reply_to
+        try:
+            data = await self._sidecar_call("/effect", body)
+        except Exception as exc:
+            return _failed_send(exc)
+        self._record_sent_message(data.get("messageId"))
+        return SendResult(success=True, message_id=data.get("messageId"))
+
+    async def share_contact_card(self, chat_id: str) -> Dict[str, Any]:
+        now = time.monotonic()
+        last = self._contact_card_last_sent.get(chat_id, 0.0)
+        if now - last < 3600.0:
+            raise PhotonSidecarError(
+                "quota_exceeded",
+                "A contact card was already shared in this chat recently.",
+            )
+        data = await self._sidecar_call("/contact-card", {"spaceId": chat_id})
+        self._contact_card_last_sent[chat_id] = now
+        if len(self._contact_card_last_sent) > 1000:
+            self._contact_card_last_sent.pop(next(iter(self._contact_card_last_sent)))
+        return data
+
+    async def send_custom_app_card(
+        self, chat_id: str, card: Dict[str, Any]
+    ) -> SendResult:
+        payload = dict(card)
+        mini = self._mini_app_config
+        app_name = str(mini.get("app_name") or "").strip()
+        bundle = str(mini.get("extension_bundle_id") or "").strip()
+        team_id = str(mini.get("team_id") or "").strip()
+        if (
+            not app_name
+            or len(app_name) > 80
+            or not re.fullmatch(r"[A-Za-z0-9.-]+", bundle)
+            or not re.fullmatch(r"[A-Z0-9]{10}", team_id)
+        ):
+            return SendResult(
+                success=False,
+                error="Photon mini-app identity is not configured",
+                error_kind="bad_format",
+            )
+        url = str(payload.get("url") or "")
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except ValueError:
+            host = ""
+        raw_allowed_hosts = mini.get("allowed_url_hosts") or []
+        if isinstance(raw_allowed_hosts, str):
+            raw_allowed_hosts = [raw_allowed_hosts]
+        allowed_hosts = {
+            str(item).strip().lower().rstrip(".")
+            for item in raw_allowed_hosts
+            if str(item).strip()
+        }
+        if not host or not allowed_hosts or not any(
+            host == allowed or host.endswith(f".{allowed}")
+            for allowed in allowed_hosts
+        ):
+            return SendResult(
+                success=False,
+                error="Mini-app URL host is not allowlisted",
+                error_kind="forbidden",
+            )
+        payload.update(
+            {
+                "appName": app_name,
+                "extensionBundleId": bundle,
+                "teamId": team_id,
+            }
+        )
+        app_store_id = mini.get("app_store_id")
+        if app_store_id is not None:
+            try:
+                app_store_id = int(app_store_id)
+            except (TypeError, ValueError):
+                return SendResult(success=False, error="Invalid mini-app App Store ID")
+            if app_store_id <= 0:
+                return SendResult(success=False, error="Invalid mini-app App Store ID")
+            payload["appStoreId"] = app_store_id
+        image_path = payload.pop("imagePath", None)
+        if image_path:
+            safe_path = self.validate_media_delivery_path(str(image_path))
+            if not safe_path:
+                return SendResult(success=False, error="unsafe app-card image path")
+            try:
+                image_bytes = Path(safe_path).read_bytes()
+            except OSError:
+                return SendResult(success=False, error="could not read app-card image")
+            if len(image_bytes) > 1_250_000 or not image_bytes.startswith(b"\xff\xd8\xff"):
+                return SendResult(
+                    success=False,
+                    error="app-card preview must be a JPEG no larger than 1.25 MB",
+                )
+            layout = dict(payload.get("layout") or {})
+            layout["imageBase64"] = base64.b64encode(image_bytes).decode("ascii")
+            payload["layout"] = layout
+        body = {"spaceId": chat_id, **payload}
+        try:
+            data = await self._sidecar_call("/custom-app-card", body)
+        except Exception as exc:
+            return _failed_send(exc)
+        self._record_sent_message(data.get("messageId"))
+        return SendResult(success=True, message_id=data.get("messageId"))
+
+    async def get_message_status(self, message_id: str) -> Dict[str, Any]:
+        return await self._sidecar_call(
+            "/message-status", {"messageId": message_id}
+        )
+
+    async def get_recipient_status(self, address: str) -> Dict[str, Any]:
+        return await self._sidecar_call("/recipient-status", {"address": address})
 
     async def send_animation(
         self,
@@ -1269,9 +1574,22 @@ class PhotonAdapter(BasePlatformAdapter):
                 del last[old]
 
     def _reactions_enabled(self) -> bool:
-        return os.getenv("PHOTON_REACTIONS", "false").strip().lower() in {
-            "true", "1", "yes", "on",
-        }
+        return self._automatic_reactions
+
+    async def _mark_read(
+        self, chat_id: str, message_id: Optional[str]
+    ) -> bool:
+        """Mark an inbound message read. Best-effort and never blocks dispatch."""
+        if not self._send_read_receipts or not chat_id or not message_id:
+            return False
+        try:
+            await self._sidecar_call(
+                "/read", {"spaceId": chat_id, "messageId": message_id}
+            )
+            return True
+        except Exception as e:
+            logger.debug("[photon] read receipt failed: %s", e)
+            return False
 
     async def _add_reaction(
         self, chat_id: str, message_id: str, emoji: str
@@ -1485,7 +1803,13 @@ class PhotonAdapter(BasePlatformAdapter):
             logger.error("[photon] Plain-text retry also failed: %s", fallback_result.error)
         return fallback_result
 
-    async def _sidecar_send(self, space_id: str, text: str) -> SendResult:
+    async def _sidecar_send(
+        self,
+        space_id: str,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
         if len(text) > self.MAX_MESSAGE_LENGTH:
             logger.warning(
                 "[photon] truncating outbound from %d to %d chars",
@@ -1497,10 +1821,12 @@ class PhotonAdapter(BasePlatformAdapter):
         # keeps accepting the body during a half-upgraded restart.
         if _markdown_enabled():
             body["format"] = "markdown"
+        if reply_to:
+            body["replyTo"] = reply_to
         try:
             data = await self._sidecar_call("/send", body)
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return _failed_send(e)
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
 
@@ -1513,6 +1839,7 @@ class PhotonAdapter(BasePlatformAdapter):
         mime_type: Optional[str] = None,
         caption: Optional[str] = None,
         kind: str = "attachment",
+        reply_to: Optional[str] = None,
     ) -> SendResult:
         """POST a local file to the sidecar's ``/send-attachment`` endpoint.
 
@@ -1528,7 +1855,7 @@ class PhotonAdapter(BasePlatformAdapter):
         safe_path = self.validate_media_delivery_path(str(path))
         if not safe_path:
             return SendResult(
-                success=False, error=f"unsafe or missing attachment path: {path}"
+                success=False, error="unsafe or missing attachment path"
             )
         if not mime_type:
             import mimetypes
@@ -1546,12 +1873,76 @@ class PhotonAdapter(BasePlatformAdapter):
             body["mimeType"] = mime_type
         if caption:
             body["caption"] = caption
+        if reply_to:
+            body["replyTo"] = reply_to
         try:
             data = await self._sidecar_call("/send-attachment", body)
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return _failed_send(e)
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
+
+    async def _fetch_attachment(
+        self,
+        attachment_id: str,
+        *,
+        phone: Optional[str] = None,
+        fallback_name: str = "attachment",
+    ) -> Optional[str]:
+        """Fetch a metadata-only Photon attachment into the safe document cache."""
+        if not attachment_id or len(attachment_id) > 512:
+            return None
+        from gateway.platforms.base import get_document_cache_dir
+
+        body: Dict[str, Any] = {"attachmentId": attachment_id}
+        if phone:
+            body["phone"] = phone
+        url = f"http://{self._sidecar_bind}:{self._sidecar_port}/attachment"
+        headers = {"X-Hermes-Sidecar-Token": self._sidecar_token}
+        cache_dir = get_document_cache_dir()
+        tmp_path: Optional[Path] = None
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream(
+                    "POST", url, json=body, headers=headers
+                ) as response:
+                    if response.status_code != 200:
+                        await response.aread()
+                        return None
+                    declared = response.headers.get("Content-Length")
+                    if declared and int(declared) > _MAX_FETCH_ATTACHMENT_BYTES:
+                        return None
+                    encoded_name = response.headers.get("X-Photon-Filename", "")
+                    safe_name = Path(unquote(encoded_name) or fallback_name).name
+                    if not safe_name or safe_name in {".", ".."}:
+                        safe_name = "attachment"
+                    final_path = cache_dir / (
+                        f"photon_{secrets.token_hex(6)}_{safe_name[:180]}"
+                    )
+                    tmp_path = final_path.with_name(final_path.name + ".part")
+                    size = 0
+                    fd = os.open(
+                        tmp_path,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                    with os.fdopen(fd, "wb") as handle:
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > _MAX_FETCH_ATTACHMENT_BYTES:
+                                raise ValueError("attachment exceeds retrieval limit")
+                            handle.write(chunk)
+                    os.replace(tmp_path, final_path)
+                    return str(final_path)
+        except Exception as exc:
+            logger.debug("[photon] attachment fetch failed: %s", exc)
+            return None
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     async def _sidecar_call(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         # Guard: adapter not yet connected (no sidecar address known).
@@ -1566,14 +1957,28 @@ class PhotonAdapter(BasePlatformAdapter):
         headers = {"X-Hermes-Sidecar-Token": self._sidecar_token}
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, json=body, headers=headers)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Photon sidecar {path} returned {resp.status_code}: {resp.text[:200]}"
-            )
-        data = resp.json() or {}
-        if not data.get("ok"):
-            raise RuntimeError(
-                f"Photon sidecar {path} reported error: {data.get('error')}"
+        try:
+            data = resp.json() or {}
+        except Exception:
+            data = {}
+        if resp.status_code != 200 or not data.get("ok"):
+            error = data.get("error")
+            if isinstance(error, dict):
+                raise PhotonSidecarError(
+                    str(error.get("code") or "internal_error"),
+                    str(error.get("message") or "Photon could not complete the operation."),
+                    retryable=bool(error.get("retryable", False)),
+                    operation_id=(
+                        str(error["operationId"])
+                        if error.get("operationId")
+                        else None
+                    ),
+                )
+            # Legacy sidecars returned an arbitrary string here, sometimes
+            # including provider stacks or identifiers. Keep compatibility
+            # with the old envelope without forwarding its uncurated text.
+            raise PhotonSidecarError(
+                "internal_error", "Photon sidecar reported a failure."
             )
         return data
 
@@ -1676,6 +2081,27 @@ def _cache_inbound_attachment(
 # is not co-resident.  Reuses a live sidecar already listening on the
 # configured port (cron processes cannot spawn the sidecar themselves).
 
+
+def _standalone_sidecar_failure(
+    status_code: int, data: Any
+) -> Dict[str, Any]:
+    """Return only the sidecar's structured, curated error fields."""
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        return {
+            "error": str(
+                error.get("message") or "Photon sidecar reported a failure."
+            )[:500],
+            "error_code": str(error.get("code") or "internal_error")[:80],
+            "retryable": bool(error.get("retryable", False)),
+        }
+    return {
+        "error": f"Photon sidecar returned HTTP {status_code}.",
+        "error_code": "internal_error",
+        "retryable": False,
+    }
+
+
 async def _standalone_send(
     pconfig: PlatformConfig,
     chat_id: str,
@@ -1716,11 +2142,12 @@ async def _standalone_send(
                 resp = await client.post(
                     f"{base}/send", json=send_body, headers=headers,
                 )
-                if resp.status_code != 200:
-                    return {"error": f"sidecar returned {resp.status_code}: {resp.text[:200]}"}
-                data = resp.json() or {}
-                if not data.get("ok"):
-                    return {"error": data.get("error") or "sidecar reported failure"}
+                try:
+                    data = resp.json() or {}
+                except Exception:
+                    data = {}
+                if resp.status_code != 200 or not data.get("ok"):
+                    return _standalone_sidecar_failure(resp.status_code, data)
                 last_message_id = data.get("messageId")
 
             # 2. Each attachment as a separate /send-attachment call.
@@ -1744,16 +2171,17 @@ async def _standalone_send(
                 resp = await client.post(
                     f"{base}/send-attachment", json=att_body, headers=headers,
                 )
-                if resp.status_code != 200:
-                    return {"error": f"sidecar returned {resp.status_code}: {resp.text[:200]}"}
-                data = resp.json() or {}
-                if not data.get("ok"):
-                    return {"error": data.get("error") or "sidecar reported failure"}
+                try:
+                    data = resp.json() or {}
+                except Exception:
+                    data = {}
+                if resp.status_code != 200 or not data.get("ok"):
+                    return _standalone_sidecar_failure(resp.status_code, data)
                 last_message_id = data.get("messageId") or last_message_id
 
         return {"success": True, "message_id": last_message_id}
-    except Exception as e:
-        return {"error": f"Photon standalone send failed: {e}"}
+    except Exception:
+        return {"error": "Photon standalone send failed."}
 
 
 # ---------------------------------------------------------------------------
@@ -1764,6 +2192,7 @@ def register(ctx) -> None:
     # Local import to avoid argparse work at module load; reused for both the
     # gateway-setup hook and the `hermes photon` CLI command below.
     from . import cli as _cli
+    from .tools import PHOTON_IMESSAGE_SCHEMA, handle_photon_imessage
 
     ctx.register_platform(
         name="photon",
@@ -1782,6 +2211,7 @@ def register(ctx) -> None:
         # channel — same unified onboarding wizard, no Photon-only detour.
         setup_fn=_cli.gateway_setup,
         env_enablement_fn=_env_enablement,
+        apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="PHOTON_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
         allowed_users_env="PHOTON_ALLOWED_USERS",
@@ -1799,8 +2229,25 @@ def register(ctx) -> None:
             "Markdown is rendered (bold, italics, lists, code), but keep "
             "formatting light and conversational. Recipient identifiers are "
             "E.164 phone numbers; never expose them in responses unless the "
-            "user asked. Attachments arrive as metadata only."
+            "user asked. Attachments and voice notes arrive as local media when "
+            "Photon can retrieve them; unavailable files carry a metadata marker. "
+            "Native iMessage tapbacks are available through send_message with "
+            "action='react'. Use them like a person would: most messages should "
+            "receive no reaction; react only when it adds genuine social meaning, "
+            "choose the emoji from context, avoid repeating the same tapback, and "
+            "never react merely to indicate processing or successful delivery. "
+            "For a genuinely long task, 👀 may acknowledge that you are looking "
+            "into it, but remove it with action='unreact' before the final reply."
         ),
+    )
+
+    ctx.register_tool(
+        name="photon_imessage",
+        toolset="photon",
+        schema=PHOTON_IMESSAGE_SCHEMA,
+        handler=handle_photon_imessage,
+        check_fn=check_tool_requirements,
+        emoji="📱",
     )
 
     # Register CLI subcommands — `hermes photon ...`

@@ -19,8 +19,15 @@
 //                         lines are heartbeats. One consumer at a time.
 //   - POST /healthz     -> {"ok": true}
 //   - POST /send        -> {"ok": true, "messageId": "..."}
-//       body: {"spaceId": "...", "text": "...",
+//       body: {"spaceId": "...", "text": "...", "replyTo": "..." | null,
 //              "format": "text" | "markdown" (default "text")}
+//   - POST /edit        -> edit an outbound message in place
+//   - POST /unsend      -> retract a recent outbound message
+//   - POST /attachment  -> raw attachment bytes fetched by GUID
+//   - POST /effect      -> send text/markdown with an iMessage effect
+//   - POST /contact-card -> share the bot account's native contact card
+//   - POST /custom-app-card -> operator-identified iMessage mini-app card
+//   - POST /message-status | /recipient-status -> bounded operational status
 //   - POST /send-attachment -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "path": "...", "name": "..." | null,
 //              "mimeType": "..." | null, "caption": "..." | null,
@@ -31,6 +38,8 @@
 //   - POST /unreact     -> {"ok": true} | 400 soft failure
 //       body: {"spaceId": "...", "messageId": "<target msg id>",
 //              "reactionId": "..." | null (restart-recovery fallback)}
+//   - POST /read        -> {"ok": true}
+//       body: {"spaceId": "...", "messageId": "<inbound msg id>"}
 //   - POST /typing      -> {"ok": true}
 //       body: {"spaceId": "...", "state": "start" | "stop"}
 //   - POST /shutdown    -> {"ok": true}; then process exits
@@ -56,6 +65,7 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
+import net from "node:net";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 
@@ -75,11 +85,29 @@ const telemetry = /^(1|true|yes|on)$/i.test(
 // balloon a single NDJSON line. Override via PHOTON_MAX_INLINE_ATTACHMENT_BYTES.
 const MAX_INLINE_ATTACHMENT_BYTES =
   Number(process.env.PHOTON_MAX_INLINE_ATTACHMENT_BYTES) || 20 * 1024 * 1024;
+const MAX_FETCH_ATTACHMENT_BYTES =
+  Number(process.env.PHOTON_MAX_FETCH_ATTACHMENT_BYTES) || 100 * 1024 * 1024;
 const DM_CHAT_GUID_RE = /^any;-;(\+\d{6,})$/;
 const E164_RE = /^\+\d{6,}$/;
 const MAX_KNOWN_SPACES = 2048;
 const MAX_KNOWN_MESSAGES = 1024;
 const MAX_REACTION_HANDLES = 512;
+const MAX_MESSAGE_STATES = 2048;
+const IMESSAGE_EFFECTS = Object.freeze({
+  slam: "com.apple.MobileSMS.expressivesend.impact",
+  loud: "com.apple.MobileSMS.expressivesend.loud",
+  gentle: "com.apple.MobileSMS.expressivesend.gentle",
+  invisible_ink: "com.apple.MobileSMS.expressivesend.invisibleink",
+  confetti: "com.apple.messages.effect.CKConfettiEffect",
+  fireworks: "com.apple.messages.effect.CKFireworksEffect",
+  balloons: "com.apple.messages.effect.CKBalloonEffect",
+  heart: "com.apple.messages.effect.CKHeartEffect",
+  lasers: "com.apple.messages.effect.CKLasersEffect",
+  celebration: "com.apple.messages.effect.CKHappyBirthdayEffect",
+  sparkles: "com.apple.messages.effect.CKSparklesEffect",
+  spotlight: "com.apple.messages.effect.CKSpotlightEffect",
+  echo: "com.apple.messages.effect.CKEchoEffect",
+});
 const STREAM_DEGRADED_RESTART_MS =
   Number(process.env.PHOTON_STREAM_DEGRADED_RESTART_MS) || 90 * 1000;
 const STREAM_INTERRUPTED_DEGRADE_COUNT =
@@ -126,7 +154,10 @@ function scheduleStreamRestart() {
   if (STREAM_DEGRADED_RESTART_MS <= 0 || streamRestartTimer) return;
   streamRestartTimer = setTimeout(() => {
     streamRestartTimer = null;
-    if (streamHealth.state !== "degraded" || streamHealth.degradedSince === null) {
+    if (
+      streamHealth.state !== "degraded" ||
+      streamHealth.degradedSince === null
+    ) {
       return;
     }
     const degradedForMs = Date.now() - streamHealth.degradedSince;
@@ -234,8 +265,14 @@ try {
 }
 let Spectrum,
   imessage,
+  imessageEffect,
+  nativeContactCard,
+  customizedMiniApp,
   attachment,
   voice,
+  spectrumReply,
+  spectrumEdit,
+  spectrumUnsend,
   spectrumText,
   spectrumMarkdown,
   spectrumTyping;
@@ -244,11 +281,19 @@ try {
     Spectrum,
     attachment,
     voice,
+    reply: spectrumReply,
+    edit: spectrumEdit,
+    unsend: spectrumUnsend,
     text: spectrumText,
     markdown: spectrumMarkdown,
     typing: spectrumTyping,
   } = await import("spectrum-ts"));
-  ({ imessage } = await import("spectrum-ts/providers/imessage"));
+  ({
+    imessage,
+    effect: imessageEffect,
+    nativeContactCard,
+    customizedMiniApp,
+  } = await import("spectrum-ts/providers/imessage"));
 } catch (e) {
   console.error(
     "photon-sidecar: spectrum-ts is not installed. Run `npm install` " +
@@ -276,6 +321,10 @@ const knownSpaces = new Map();
 // Inbound Message objects by id, so /react can usually skip a
 // `space.getMessage` round trip when tapping back on a recent message.
 const knownMessages = new Map();
+// Bounded operational ledger for sends made during this sidecar lifetime.
+// "accepted" means Photon accepted the operation; Spectrum's public cloud API
+// does not currently expose authoritative outbound delivered/read events.
+const messageStates = new Map();
 // One reaction handle per reacted-to message (key `${spaceId}\0${messageId}`,
 // value {emoji, handle}) — mirrors iMessage's one-tapback-per-sender
 // semantics; a new /react on the same target overwrites the slot. The handle
@@ -301,6 +350,24 @@ function rememberKnownMessage(message) {
   const id = message?.id;
   if (!id || typeof id !== "string") return;
   lruSet(knownMessages, id, message, MAX_KNOWN_MESSAGES);
+}
+
+function rememberMessageState(messageId, state, extra = {}) {
+  if (!messageId || typeof messageId !== "string") return;
+  lruSet(
+    messageStates,
+    messageId,
+    {
+      messageId,
+      state,
+      updatedAt: new Date().toISOString(),
+      delivered: null,
+      read: null,
+      deliveryObservation: "unavailable",
+      ...extra,
+    },
+    MAX_MESSAGE_STATES
+  );
 }
 
 function phoneTargetFromSpaceId(spaceId) {
@@ -366,12 +433,8 @@ async function normalizeBinaryContent(content) {
     meta.duration = content.duration;
   }
 
-  // Read the bytes eagerly and base64-inline them as `data` so the Python
-  // adapter can cache the real file (the agent then sees images and can run
-  // STT on voice notes). Spectrum content objects may not outlive this stream
-  // iteration, so a lazy/on-demand fetch isn't safe. Over-cap content (when
-  // size is known up front) is forwarded as metadata only and the adapter falls
-  // back to a text marker. A read failure must never break the inbound loop.
+  // Inline only bounded streams. Larger or unreadable content stays metadata-only
+  // and the Python adapter retrieves it later by attachment GUID.
   const label = `${content.type} ${meta.name ?? meta.id ?? "(unnamed)"}`;
   if (meta.size !== null && meta.size > MAX_INLINE_ATTACHMENT_BYTES) {
     console.error(
@@ -380,25 +443,27 @@ async function normalizeBinaryContent(content) {
     );
     return meta;
   }
-  if (typeof content.read === "function") {
+  if (typeof content.stream === "function") {
     try {
-      const buf = await content.read();
-      // Guard the case where size was unknown but the bytes turn out to be
-      // over the cap.
-      if (buf && buf.length > MAX_INLINE_ATTACHMENT_BYTES) {
-        console.error(
-          `photon-sidecar: ${label} (${buf.length} bytes) ` +
-            `exceeds inline cap after read; forwarding metadata only`
-        );
-        return meta;
+      const source = await content.stream();
+      const chunks = [];
+      let total = 0;
+      for await (const chunk of source) {
+        const bytes = Buffer.from(chunk);
+        if (total + bytes.length > MAX_INLINE_ATTACHMENT_BYTES) {
+          console.error(
+            `photon-sidecar: ${label} exceeds inline cap; forwarding metadata only`
+          );
+          return meta;
+        }
+        chunks.push(bytes);
+        total += bytes.length;
       }
-      meta.data = Buffer.from(buf).toString("base64");
+      meta.data = Buffer.concat(chunks, total).toString("base64");
       meta.encoding = "base64";
-    } catch (e) {
+    } catch {
       console.error(
-        `photon-sidecar: failed to read ${content.type} bytes ` +
-          "(forwarding metadata only): " +
-          (e && e.stack ? e.stack : String(e))
+        `photon-sidecar: failed to stream ${content.type} bytes; forwarding metadata only`
       );
     }
   }
@@ -484,11 +549,16 @@ async function normalizeEvent(space, message) {
         // iMessage spaces carry `type` ("dm"|"group") and `phone` directly.
         type: space.type ?? msgSpace.type ?? "dm",
         phone: space.phone ?? msgSpace.phone ?? null,
+        name:
+          space.displayName ??
+          space.name ??
+          msgSpace.displayName ??
+          msgSpace.name ??
+          null,
       },
       sender: { id: message.sender ? message.sender.id : null },
       content: await normalizeContent(message.content),
-      timestamp:
-        ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
+      timestamp: ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
     };
   } catch (e) {
     console.error(
@@ -588,28 +658,277 @@ async function readBody(req) {
 function unauthorized(res) {
   res.statusCode = 401;
   res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
+  res.end(
+    JSON.stringify({
+      ok: false,
+      error: {
+        code: "auth_failed",
+        message: "The sidecar authorization token is invalid.",
+        retryable: false,
+      },
+    })
+  );
 }
 
-function badRequest(res, msg) {
-  res.statusCode = 400;
+function badRequest(res, msg, code = "invalid_request") {
+  res.statusCode = code === "not_found" ? 404 : 400;
   res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: msg }));
+  res.end(
+    JSON.stringify({
+      ok: false,
+      error: { code, message: msg, retryable: false },
+    })
+  );
 }
 
-function serverError(res) {
-  res.statusCode = 500;
+function classifySafeError(error) {
+  const rawCode = String(error?.code || error?.cause?.code || "").toLowerCase();
+  const normalizedCode = rawCode.replace(/[^a-z0-9]/g, "");
+  const name = String(error?.name || "").toLowerCase();
+  const message = String(
+    error?.message || error?.cause?.message || error || ""
+  );
+  const lower = message.toLowerCase();
+
+  if (lower.includes("photon-managed shared line")) {
+    return {
+      status: 400,
+      code: "managed_line_target",
+      message: "The target is a Photon-managed sending line, not a recipient.",
+      retryable: false,
+    };
+  }
+  if (lower.includes("target not allowed")) {
+    return {
+      status: 403,
+      code: "target_not_allowed",
+      message:
+        "The recipient must initiate the shared-line conversation first.",
+      retryable: false,
+    };
+  }
+  if (
+    normalizedCode.includes("resourceexhausted") ||
+    normalizedCode.includes("rate") ||
+    lower.includes("quota") ||
+    lower.includes("rate limit")
+  ) {
+    return {
+      status: 429,
+      code: "quota_exceeded",
+      message:
+        "Photon rejected the operation because a quota or rate limit was reached.",
+      retryable: true,
+    };
+  }
+  if (normalizedCode.includes("notfound") || lower.includes("not found")) {
+    return {
+      status: 404,
+      code: "not_found",
+      message:
+        "The requested Photon message, attachment, or conversation was not found.",
+      retryable: false,
+    };
+  }
+  if (
+    normalizedCode.includes("operationnotsupported") ||
+    name.includes("unsupported") ||
+    lower.includes("not supported") ||
+    lower.includes("unsupported")
+  ) {
+    return {
+      status: 400,
+      code: "unsupported",
+      message:
+        "Photon does not support this operation for the current line or content.",
+      retryable: false,
+    };
+  }
+  if (
+    normalizedCode.includes("unauth") ||
+    normalizedCode.includes("permission") ||
+    name.includes("authentication")
+  ) {
+    return {
+      status: 401,
+      code: "auth_failed",
+      message:
+        "Photon rejected the project credentials or target authorization.",
+      retryable: false,
+    };
+  }
+  if (
+    normalizedCode.includes("serviceunavailable") ||
+    normalizedCode.includes("timeout") ||
+    normalizedCode.includes("internal") ||
+    lower.includes("temporarily unavailable") ||
+    lower.includes("timed out")
+  ) {
+    return {
+      status: 503,
+      code: "upstream_unavailable",
+      message: "Photon is temporarily unavailable; retry the operation later.",
+      retryable: true,
+    };
+  }
+  if (
+    normalizedCode.includes("invalidargument") ||
+    normalizedCode.includes("preconditionfailed") ||
+    (lower.includes("outside") && lower.includes("window"))
+  ) {
+    return {
+      status: 400,
+      code: "invalid_request",
+      message:
+        "Photon rejected the operation because its arguments or state are invalid.",
+      retryable: false,
+    };
+  }
+  return {
+    status: 500,
+    code: "internal_error",
+    message: "Photon could not complete the operation.",
+    retryable: false,
+  };
+}
+
+function serverError(res, error, operationId = null) {
+  const safe = classifySafeError(error);
+  res.statusCode = safe.status;
   res.setHeader("Content-Type", "application/json");
-  // Don't leak stack traces or raw exception text to the caller — even
-  // though we listen on loopback, the supervisor logs the real error
-  // and the client only needs a generic failure signal.
-  res.end(JSON.stringify({ ok: false, error: "internal sidecar error" }));
+  // Return only curated fields. Provider stacks, identifiers, and credentials
+  // never cross the loopback boundary or enter routine handler logs.
+  res.end(
+    JSON.stringify({
+      ok: false,
+      error: {
+        code: safe.code,
+        message: safe.message,
+        retryable: safe.retryable,
+        ...(operationId ? { operationId } : {}),
+      },
+    })
+  );
 }
 
 function ok(res, data) {
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/json");
   res.end(JSON.stringify({ ok: true, ...data }));
+}
+
+function safeHeaderValue(value, fallback) {
+  const text = String(value || fallback || "attachment")
+    .replace(/[\r\n]/g, "_")
+    .slice(0, 255);
+  return encodeURIComponent(text);
+}
+
+function privateAddress(address) {
+  if (net.isIPv4(address)) {
+    const [a, b] = address.split(".").map(Number);
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224
+    );
+  }
+  if (net.isIPv6(address)) {
+    const lower = address.toLowerCase();
+    if (lower.startsWith("::ffff:")) {
+      return privateAddress(lower.slice("::ffff:".length));
+    }
+    return (
+      lower === "::" ||
+      lower === "::1" ||
+      lower.startsWith("fc") ||
+      lower.startsWith("fd") ||
+      /^fe[89ab]/.test(lower)
+    );
+  }
+  return true;
+}
+
+function validHttpUrl(value) {
+  try {
+    const parsed = new URL(String(value || ""));
+    if (parsed.protocol !== "https:") return null;
+    if (parsed.username || parsed.password) return null;
+    const rawHostname = parsed.hostname.toLowerCase();
+    const hostname =
+      rawHostname.startsWith("[") && rawHostname.endsWith("]")
+        ? rawHostname.slice(1, -1)
+        : rawHostname;
+    if (
+      hostname === "localhost" ||
+      hostname.endsWith(".localhost") ||
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".internal")
+    ) {
+      return null;
+    }
+    if (net.isIP(hostname) && privateAddress(hostname)) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function normalizeCardLayout(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const out = {};
+  for (const key of [
+    "caption",
+    "subcaption",
+    "trailingCaption",
+    "trailingSubcaption",
+    "summary",
+  ]) {
+    if (typeof input[key] === "string" && input[key].length > 1000) return null;
+    if (typeof input[key] === "string" && input[key].trim()) {
+      out[key] = input[key].trim();
+    }
+  }
+  if (
+    (input.imageTitle || input.imageSubtitle) &&
+    typeof input.imageBase64 !== "string"
+  ) {
+    return null;
+  }
+  if (typeof input.imageBase64 === "string") {
+    if (
+      input.imageBase64.length > 1_700_000 ||
+      typeof input.imageTitle !== "string" ||
+      !input.imageTitle.trim() ||
+      input.imageTitle.length > 500 ||
+      (typeof input.imageSubtitle === "string" &&
+        input.imageSubtitle.length > 500)
+    ) {
+      return null;
+    }
+    const image = Buffer.from(input.imageBase64, "base64");
+    if (
+      image.length > 1_250_000 ||
+      image.length < 3 ||
+      image[0] !== 0xff ||
+      image[1] !== 0xd8 ||
+      image[2] !== 0xff
+    ) {
+      return null;
+    }
+    out.image = image;
+    out.imageTitle = input.imageTitle.trim();
+    if (typeof input.imageSubtitle === "string" && input.imageSubtitle.trim()) {
+      out.imageSubtitle = input.imageSubtitle.trim();
+    }
+  }
+  return Object.keys(out).some((key) => key !== "summary") ? out : null;
 }
 
 function handleInbound(req, res) {
@@ -646,6 +965,16 @@ function handleInbound(req, res) {
 }
 
 async function resolveSpace(spaceId) {
+  if (
+    typeof spaceId !== "string" ||
+    !spaceId ||
+    spaceId.length > 512 ||
+    /[\u0000-\u001f]/.test(spaceId)
+  ) {
+    const error = new Error("invalid space identifier");
+    error.code = "invalid_argument";
+    throw error;
+  }
   const cached = knownSpaces.get(spaceId);
   if (cached) return cached;
 
@@ -689,6 +1018,37 @@ async function resolveSpace(spaceId) {
   return space;
 }
 
+async function resolveMessage(space, messageId) {
+  if (
+    !messageId ||
+    typeof messageId !== "string" ||
+    messageId.length > 512 ||
+    /[\u0000-\u001f]/.test(messageId)
+  ) {
+    return null;
+  }
+  const cached = knownMessages.get(messageId);
+  if (cached) return cached;
+  const message = await space.getMessage(messageId);
+  if (message) rememberKnownMessage(message);
+  return message || null;
+}
+
+async function sendBuilder(space, builder, replyTo) {
+  let outbound = builder;
+  if (replyTo) {
+    const target = await resolveMessage(space, replyTo);
+    if (!target) throw new Error("reply target message not found");
+    outbound = spectrumReply(builder, target);
+  }
+  const result = await space.send(outbound);
+  rememberKnownMessage(result);
+  if (result?.id) {
+    rememberMessageState(result.id, "accepted", { operation: "send" });
+  }
+  return result;
+}
+
 // Constant-time token comparison — don't leak the token via `!==` timing.
 const _tokenBuf = Buffer.from(sharedToken);
 function tokenOk(header) {
@@ -709,6 +1069,7 @@ const server = http.createServer(async (req, res) => {
     res.statusCode = 405;
     return res.end();
   }
+  let body = {};
   try {
     if (req.url === "/healthz") {
       return ok(res, { stream: streamHealthSnapshot() });
@@ -718,10 +1079,178 @@ const server = http.createServer(async (req, res) => {
       setTimeout(() => process.kill(process.pid, "SIGTERM"), 50);
       return;
     }
-    const body = await readBody(req);
+    body = await readBody(req);
+    if (req.url === "/attachment") {
+      const { attachmentId, phone = null } = body || {};
+      if (
+        typeof attachmentId !== "string" ||
+        !attachmentId ||
+        attachmentId.length > 512 ||
+        /[\u0000-\u001f]/.test(attachmentId)
+      ) {
+        return badRequest(res, "a valid attachmentId is required");
+      }
+      if (phone && !E164_RE.test(phone)) {
+        return badRequest(res, "phone must be E.164 when provided");
+      }
+      const narrowed = imessage(app);
+      const item = await narrowed.getAttachment(
+        attachmentId,
+        phone || undefined
+      );
+      if (!item) return badRequest(res, "attachment not found", "not_found");
+      const declaredSize = Number(item.size);
+      if (!Number.isFinite(declaredSize) || declaredSize <= 0) {
+        return badRequest(
+          res,
+          "attachment size is unavailable; refusing an unbounded read"
+        );
+      }
+      if (declaredSize > MAX_FETCH_ATTACHMENT_BYTES) {
+        res.statusCode = 413;
+        res.setHeader("Content-Type", "application/json");
+        return res.end(
+          JSON.stringify({
+            ok: false,
+            error: {
+              code: "attachment_too_large",
+              message: "The attachment exceeds the configured retrieval limit.",
+              retryable: false,
+            },
+          })
+        );
+      }
+      const source = await item.stream();
+      res.statusCode = 200;
+      res.setHeader(
+        "Content-Type",
+        item.mimeType || "application/octet-stream"
+      );
+      res.setHeader(
+        "X-Photon-Filename",
+        safeHeaderValue(item.name, "attachment")
+      );
+      let received = 0;
+      for await (const chunk of source) {
+        const bytes = Buffer.from(chunk);
+        received += bytes.length;
+        if (received > MAX_FETCH_ATTACHMENT_BYTES) {
+          res.destroy(
+            new Error("attachment exceeded configured retrieval limit")
+          );
+          return;
+        }
+        if (!res.write(bytes)) await once(res, "drain");
+      }
+      return res.end();
+    }
+    if (req.url === "/effect") {
+      const {
+        spaceId,
+        text,
+        effect,
+        format = "text",
+        replyTo = null,
+      } = body || {};
+      if (!spaceId || typeof text !== "string" || !text || text.length > 8000) {
+        return badRequest(res, "spaceId and text are required");
+      }
+      const effectValue = IMESSAGE_EFFECTS[effect];
+      if (!effectValue) {
+        return badRequest(res, "effect is not supported", "unsupported");
+      }
+      if (format !== "text" && format !== "markdown") {
+        return badRequest(res, "format must be text or markdown");
+      }
+      const space = await resolveSpace(spaceId);
+      const inner =
+        format === "markdown" ? spectrumMarkdown(text) : spectrumText(text);
+      const result = await sendBuilder(
+        space,
+        imessageEffect(inner, effectValue),
+        replyTo
+      );
+      return ok(res, { messageId: result?.id || null });
+    }
+    if (req.url === "/contact-card") {
+      const { spaceId } = body || {};
+      if (!spaceId) return badRequest(res, "spaceId is required");
+      const space = await resolveSpace(spaceId);
+      await space.send(nativeContactCard());
+      return ok(res, { state: "accepted" });
+    }
+    if (req.url === "/custom-app-card") {
+      const {
+        spaceId,
+        appName,
+        extensionBundleId,
+        teamId,
+        url,
+        layout,
+        appStoreId = null,
+        replyTo = null,
+      } = body || {};
+      const safeUrl = validHttpUrl(url);
+      const safeLayout = normalizeCardLayout(layout);
+      if (
+        !spaceId ||
+        typeof appName !== "string" ||
+        !appName.trim() ||
+        appName.length > 80 ||
+        typeof extensionBundleId !== "string" ||
+        !/^[A-Za-z0-9.-]+$/.test(extensionBundleId) ||
+        !/^[A-Z0-9]{10}$/.test(String(teamId || "")) ||
+        !safeUrl ||
+        !safeLayout
+      ) {
+        return badRequest(res, "custom app-card fields are invalid");
+      }
+      if (
+        appStoreId !== null &&
+        (!Number.isInteger(appStoreId) || appStoreId <= 0)
+      ) {
+        return badRequest(res, "appStoreId must be a positive integer");
+      }
+      const input = {
+        appName: appName.trim(),
+        extensionBundleId,
+        teamId,
+        url: safeUrl,
+        layout: safeLayout,
+      };
+      if (appStoreId !== null) input.appStoreId = appStoreId;
+      const space = await resolveSpace(spaceId);
+      const result = await sendBuilder(
+        space,
+        customizedMiniApp(input),
+        replyTo
+      );
+      return ok(res, { messageId: result?.id || null });
+    }
+    if (req.url === "/message-status") {
+      const { messageId } = body || {};
+      if (!messageId) return badRequest(res, "messageId is required");
+      const state = messageStates.get(messageId);
+      if (!state)
+        return badRequest(res, "message state not found", "not_found");
+      return ok(res, { status: state });
+    }
+    if (req.url === "/recipient-status") {
+      const { address } = body || {};
+      if (typeof address !== "string" || !E164_RE.test(address)) {
+        return badRequest(res, "address must be an E.164 phone number");
+      }
+      const user = await imessage(app).user(address);
+      return ok(res, {
+        recipient: {
+          service: user?.service || "unknown",
+          country: user?.country || null,
+        },
+      });
+    }
     if (req.url === "/send") {
-      const { spaceId, text, format = "text" } = body || {};
-      if (!spaceId || typeof text !== "string") {
+      const { spaceId, text, format = "text", replyTo = null } = body || {};
+      if (!spaceId || typeof text !== "string" || text.length > 8000) {
         return badRequest(res, "spaceId and text are required");
       }
       if (format !== "text" && format !== "markdown") {
@@ -732,12 +1261,19 @@ const server = http.createServer(async (req, res) => {
       // readable plain text on platforms that don't.
       const builder =
         format === "markdown" ? spectrumMarkdown(text) : spectrumText(text);
-      const result = await space.send(builder);
+      const result = await sendBuilder(space, builder, replyTo);
       return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-attachment") {
-      const { spaceId, path, name, mimeType, caption, kind } =
-        body || {};
+      const {
+        spaceId,
+        path,
+        name,
+        mimeType,
+        caption,
+        kind,
+        replyTo = null,
+      } = body || {};
       if (!spaceId || typeof path !== "string" || !path) {
         return badRequest(res, "spaceId and path are required");
       }
@@ -754,11 +1290,11 @@ const server = http.createServer(async (req, res) => {
           ? voice(path, Object.keys(opts).length ? opts : undefined)
           : attachment(path, Object.keys(opts).length ? opts : undefined);
 
-      const result = await space.send(builder);
+      const result = await sendBuilder(space, builder, replyTo);
 
       // iMessage delivers the caption as a separate bubble; send it
       // after the media so the attachment renders first.
-      if (caption && typeof caption === "string") {
+      if (caption && typeof caption === "string" && caption.length <= 8000) {
         try {
           await space.send(spectrumText(caption));
         } catch (e) {
@@ -770,6 +1306,38 @@ const server = http.createServer(async (req, res) => {
       }
       return ok(res, { messageId: result?.id || null });
     }
+    if (req.url === "/edit") {
+      const { spaceId, messageId, text } = body || {};
+      if (
+        !spaceId ||
+        !messageId ||
+        typeof text !== "string" ||
+        text.length > 8000
+      ) {
+        return badRequest(res, "spaceId, messageId and text are required");
+      }
+      const space = await resolveSpace(spaceId);
+      // Spectrum rehydrates getMessage() results as inbound wrappers, which
+      // cannot be edited. Only live outbound handles from this process are valid.
+      const target = knownMessages.get(messageId);
+      if (!target) return badRequest(res, "message not found", "not_found");
+      await space.send(spectrumEdit(spectrumText(text), target));
+      rememberMessageState(messageId, "edited", { operation: "edit" });
+      return ok(res, { messageId });
+    }
+    if (req.url === "/unsend") {
+      const { spaceId, messageId } = body || {};
+      if (!spaceId || !messageId) {
+        return badRequest(res, "spaceId and messageId are required");
+      }
+      const space = await resolveSpace(spaceId);
+      const target = knownMessages.get(messageId);
+      if (!target) return badRequest(res, "message not found", "not_found");
+      await space.send(spectrumUnsend(target));
+      knownMessages.delete(messageId);
+      rememberMessageState(messageId, "unsent", { operation: "unsend" });
+      return ok(res, { messageId });
+    }
     if (req.url === "/react") {
       const { spaceId, messageId, emoji } = body || {};
       if (!spaceId || !messageId || typeof emoji !== "string" || !emoji) {
@@ -779,11 +1347,15 @@ const server = http.createServer(async (req, res) => {
       const target =
         knownMessages.get(messageId) ?? (await space.getMessage(messageId));
       if (!target) {
-        return badRequest(res, "message not found");
+        return badRequest(res, "message not found", "not_found");
       }
       const handle = await target.react(emoji);
       if (!handle) {
-        return badRequest(res, "reactions not supported on this platform");
+        return badRequest(
+          res,
+          "reactions not supported on this platform",
+          "unsupported"
+        );
       }
       lruSet(
         reactionHandles,
@@ -824,9 +1396,23 @@ const server = http.createServer(async (req, res) => {
               (e && e.message ? e.message : String(e))
           );
         }
-        return badRequest(res, "reaction not removable");
+        return badRequest(res, "reaction not removable", "not_found");
       }
-      return badRequest(res, "no tracked reaction for message");
+      return badRequest(res, "no tracked reaction for message", "not_found");
+    }
+    if (req.url === "/read") {
+      const { spaceId, messageId } = body || {};
+      if (!spaceId || !messageId) {
+        return badRequest(res, "spaceId and messageId are required");
+      }
+      const space = await resolveSpace(spaceId);
+      const target =
+        knownMessages.get(messageId) ?? (await space.getMessage(messageId));
+      if (!target) {
+        return badRequest(res, "message not found", "not_found");
+      }
+      await target.read();
+      return ok(res, {});
     }
     if (req.url === "/typing") {
       const { spaceId, state = "start" } = body || {};
@@ -838,17 +1424,19 @@ const server = http.createServer(async (req, res) => {
       await space.send(spectrumTyping(state));
       return ok(res, {});
     }
-    res.statusCode = 404;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: false, error: "not found" }));
+    return badRequest(res, "sidecar endpoint not found", "not_found");
   } catch (e) {
-    console.error(
-      "photon-sidecar: handler error: " +
-        (e && e.stack ? e.stack : String(e))
-    );
-    // serverError() intentionally returns a generic message — see its
-    // body for the rationale.
-    return serverError(res);
+    const safe = classifySafeError(e);
+    console.error(`photon-sidecar: handler error: ${safe.code}`);
+    const operationId =
+      typeof body?.messageId === "string" && body.messageId
+        ? body.messageId
+        : `failed:${crypto.randomUUID()}`;
+    rememberMessageState(operationId, "failed", {
+      operation: String(req.url || "unknown").replace(/^\//, ""),
+      errorCode: safe.code,
+    });
+    return serverError(res, e, operationId);
   }
 });
 

@@ -278,6 +278,15 @@ class GatewayStreamConsumer:
         self._adapter_requires_finalize: bool = (
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
+        raw_edit_limit = getattr(adapter, "MAX_STREAMING_EDITS_PER_MESSAGE", None)
+        self._max_streaming_edits: Optional[int] = (
+            raw_edit_limit
+            if isinstance(raw_edit_limit, int)
+            and not isinstance(raw_edit_limit, bool)
+            and raw_edit_limit > 0
+            else None
+        )
+        self._streaming_edit_count = 0
 
         # Session staleness guard — when set to False (e.g. after /new or
         # /stop), the run() loop will abandon the stream early instead of
@@ -2014,6 +2023,16 @@ class GatewayStreamConsumer:
                         finalize and self._adapter_requires_finalize
                     ):
                         return True
+                    if (
+                        not finalize
+                        and self._max_streaming_edits is not None
+                        and self._streaming_edit_count
+                        >= self._max_streaming_edits - 1
+                    ):
+                        # Keep the last actually visible text as the comparison
+                        # baseline. The reserved final edit will deliver the
+                        # newest accumulated frame.
+                        return False
                     # Fresh-final for long-lived previews: when finalizing
                     # the last edit in a streaming sequence, if the
                     # original preview has been visible for at least
@@ -2100,9 +2119,11 @@ class GatewayStreamConsumer:
                             self._message_id = str(result.message_id)
                             self._message_created_ts = time.monotonic()
                             self._last_sent_text = ""
+                            self._streaming_edit_count = 0
                             self._notify_new_message()
                         else:
                             self._last_sent_text = text
+                            self._streaming_edit_count += 1
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
                         return True
@@ -2232,6 +2253,7 @@ class GatewayStreamConsumer:
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id
+                        self._streaming_edit_count = 0
                         # Track when the preview first became visible to
                         # the user so fresh-final logic can detect stale
                         # preview timestamps on long-running responses.

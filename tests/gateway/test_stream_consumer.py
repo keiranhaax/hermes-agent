@@ -149,6 +149,35 @@ class TestFinalizeCapabilityGate:
         assert picky.edit_message.call_args[1]["finalize"] is True
 
 
+class TestStreamingEditBudget:
+    @pytest.mark.asyncio
+    async def test_reserves_final_edit_without_claiming_suppressed_frame(self):
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = False
+        adapter.MAX_STREAMING_EDITS_PER_MESSAGE = 5
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="m1")
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="m1")
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat_1")
+
+        assert await consumer._send_or_edit("initial") is True
+        for text in ("one", "two", "three", "four"):
+            assert await consumer._send_or_edit(text) is True
+        # Fifth interim frame is coalesced and must not become the visible
+        # comparison baseline.
+        assert await consumer._send_or_edit("FINAL") is False
+        assert consumer._last_sent_text == "four"
+
+        assert await consumer._send_or_edit("FINAL", finalize=True) is True
+        assert adapter.edit_message.await_count == 5
+        assert adapter.edit_message.await_args_list[-1].kwargs["content"] == "FINAL"
+        assert adapter.edit_message.await_args_list[-1].kwargs["finalize"] is True
+
+
 class TestEditMessageFinalizeSignature:
     """Every concrete platform adapter must accept the ``finalize`` kwarg.
 
@@ -172,6 +201,7 @@ class TestEditMessageFinalizeSignature:
             ("plugins.platforms.feishu.adapter", "FeishuAdapter"),
             ("plugins.platforms.whatsapp.adapter", "WhatsAppAdapter"),
             ("plugins.platforms.dingtalk.adapter", "DingTalkAdapter"),
+            ("plugins.platforms.photon.adapter", "PhotonAdapter"),
         ],
     )
     def test_edit_message_accepts_finalize(self, module_path, class_name):

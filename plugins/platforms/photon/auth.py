@@ -709,6 +709,48 @@ def regenerate_project_secret(token: str, project_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Spectrum API: project diagnostics
+
+
+def _unwrap_object(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    inner = data.get("data")
+    return inner if isinstance(inner, dict) else data
+
+
+def get_subscription_details(
+    project_id: str, project_secret: str
+) -> Dict[str, Any]:
+    """Return safe plan-tier and subscription-status fields for diagnostics."""
+    if httpx is None:
+        raise RuntimeError("httpx is required for Photon")
+    url = f"{_spectrum_host()}/projects/{project_id}/billing/subscription"
+    resp = httpx.get(url, headers=_basic(project_id, project_secret), timeout=5.0)
+    _raise_for_status(resp, "subscription-status")
+    data = _unwrap_object(resp.json() or {})
+    return {
+        "tier": data.get("tier"),
+        "status": data.get("status"),
+        "cancel_at_period_end": bool(data.get("cancel_at_period_end", False)),
+    }
+
+
+def get_imessage_service_info(
+    project_id: str, project_secret: str
+) -> Dict[str, Any]:
+    """Return whether the project uses shared or dedicated iMessage service."""
+    if httpx is None:
+        raise RuntimeError("httpx is required for Photon")
+    url = f"{_spectrum_host()}/projects/{project_id}/imessage/"
+    resp = httpx.get(url, headers=_basic(project_id, project_secret), timeout=5.0)
+    _raise_for_status(resp, "imessage-status")
+    data = _unwrap_object(resp.json() or {})
+    service_type = data.get("type")
+    return {"type": service_type if service_type in {"shared", "dedicated"} else None}
+
+
+# ---------------------------------------------------------------------------
 # Spectrum API: users
 
 def _normalize_phone(phone: str) -> str:

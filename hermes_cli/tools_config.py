@@ -150,7 +150,15 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
+_DEFAULT_OFF_TOOLSETS = {
+    "homeassistant",
+    "spotify",
+    "discord",
+    "discord_admin",
+    "video",
+    "video_gen",
+    "x_search",
+}
 
 
 def _xai_credentials_present() -> bool:
@@ -190,6 +198,7 @@ def _xai_credentials_present() -> bool:
 _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
     "discord": {"discord"},
     "discord_admin": {"discord"},
+    "photon": {"photon"},
 }
 
 
@@ -1926,6 +1935,8 @@ def _get_platform_tools(
         known_map = config.get("known_plugin_toolsets", {}) or {}
         known_for_platform = set(known_map.get(platform, []) or [])
         for pts in plugin_ts_keys:
+            if not _toolset_allowed_for_platform(pts, platform):
+                continue
             if pts in toolset_names:
                 # Explicitly listed in config — enabled
                 enabled_toolsets.add(pts)
