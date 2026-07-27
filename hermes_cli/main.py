@@ -15038,6 +15038,28 @@ def _first_positional_argv() -> str | None:
     return None
 
 
+def _resolve_deferred_plugin_cli_target() -> None:
+    """Load only the deferred platform matching an invoked plugin command.
+
+    Platform plugins stay lazy during ordinary CLI startup. When the first
+    positional token is an otherwise-unknown command such as ``photon``, resolve
+    that one platform so its ``register_cli_command`` hook can populate the
+    parser without importing every bundled adapter.
+    """
+    target = _first_positional_argv()
+    if not target:
+        return
+    try:
+        from gateway.platform_registry import platform_registry
+
+        platform_registry.get(target)
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "Deferred platform CLI resolution failed for %s", target,
+            exc_info=True,
+        )
+
+
 def _plugin_cli_discovery_needed() -> bool:
     """True when the CLI might be invoking a plugin-registered subcommand.
 
@@ -15913,6 +15935,7 @@ def main():
                 seen_plugin_commands.add(cmd_info["name"])
 
             discover_plugins()
+            _resolve_deferred_plugin_cli_target()
             for cmd_info in get_plugin_manager()._cli_commands.values():
                 if cmd_info["name"] in seen_plugin_commands:
                     continue

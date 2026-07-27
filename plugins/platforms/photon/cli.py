@@ -22,6 +22,7 @@ import argparse
 import getpass
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -311,10 +312,55 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     photon_auth.print_credential_summary(print)
     node_bin = os.getenv("PHOTON_NODE_BIN") or shutil.which("node")
     sidecar_installed = (_SIDECAR_DIR / "node_modules").exists()
-    print(f"  node binary         : {node_bin or '✗ missing (install Node 18+)'}")
+    sidecar_port = _status_sidecar_port()
+    sidecar_listening = _sidecar_is_listening(sidecar_port)
+    print(
+        f"  node binary         : "
+        f"{node_bin or '✗ missing (install Node 20.18.1+)'}"
+    )
     print(f"  sidecar deps        : {'✓ installed' if sidecar_installed else '✗ run `hermes photon install-sidecar`'}")
+    print(
+        f"  sidecar listener    : "
+        f"{'✓ 127.0.0.1:' + str(sidecar_port) if sidecar_listening else 'not running'}"
+    )
     print(f"  telemetry           : {'on' if _telemetry_enabled() else 'off'} (`hermes photon telemetry on|off`)")
+    _print_cloud_status()
     return 0
+
+
+def _status_sidecar_port() -> int:
+    try:
+        return int(os.getenv("PHOTON_SIDECAR_PORT", "8789"))
+    except (TypeError, ValueError):
+        return 8789
+
+
+def _sidecar_is_listening(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _print_cloud_status() -> None:
+    project_id, project_secret = photon_auth.load_project_credentials()
+    if not project_id or not project_secret:
+        return
+    try:
+        plan = photon_auth.get_subscription_details(project_id, project_secret)
+        tier = plan.get("tier") or "unknown"
+        status = plan.get("status") or "none"
+        print(f"  subscription        : {tier} ({status})")
+    except Exception:
+        print("  subscription        : unavailable")
+    try:
+        service = photon_auth.get_imessage_service_info(project_id, project_secret)
+        line_mode = service.get("type") or "unknown"
+        print(f"  iMessage line mode  : {line_mode}")
+    except Exception:
+        print("  iMessage line mode  : unavailable")
+    print("  documented quotas   : 5,000 messages/day; 50 new conversations/line/day")
 
 
 def _refresh_status_numbers() -> None:
@@ -369,7 +415,7 @@ def _install_sidecar() -> int:
     npm = shutil.which("npm") or "npm"
     if not shutil.which(npm):
         print(
-            "npm is not on PATH. Install Node.js 18+ (https://nodejs.org/) "
+            "npm is not on PATH. Install Node.js 20.18.1+ (https://nodejs.org/) "
             "and re-run.",
             file=sys.stderr,
         )

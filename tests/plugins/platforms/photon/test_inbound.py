@@ -61,9 +61,11 @@ async def test_dispatch_text_dm(monkeypatch: pytest.MonkeyPatch) -> None:
     src = event.source
     assert src is not None
     assert src.platform == Platform("photon")
-    assert src.chat_id == "+15551234567"
+    expected_source = _dm_event("")
+    assert src.chat_id == expected_source["space"]["id"]
     assert src.chat_type == "dm"
-    assert src.user_id == "+15551234567"
+    assert src.user_id == expected_source["sender"]["id"]
+    assert src.chat_name == src.user_id
 
 
 @pytest.mark.asyncio
@@ -73,13 +75,19 @@ async def test_dispatch_group_type(monkeypatch: pytest.MonkeyPatch) -> None:
 
     event = {
         "messageId": "spc-msg-grp",
-        "space": {"id": "group-guid-xyz", "type": "group", "phone": None},
+        "space": {
+            "id": "group-guid-xyz",
+            "type": "group",
+            "phone": None,
+            "name": "Project chat",
+        },
         "sender": {"id": "+15551234567"},
         "content": {"type": "text", "text": "hi group"},
         "timestamp": "2026-05-14T19:06:32.000Z",
     }
     await adapter._dispatch_inbound(event)
     assert captured[0].source.chat_type == "group"
+    assert captured[0].source.chat_name == "Project chat"
 
 
 # A real 1x1 transparent PNG (passes base.py's _looks_like_image magic check).
@@ -134,6 +142,42 @@ async def test_dispatch_attachment_without_bytes_surfaces_marker(
     assert ev.media_types == []
 
 
+@pytest.mark.asyncio
+async def test_dispatch_metadata_only_attachment_fetches_by_guid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    cached = tmp_path / "large.mov"
+    cached.write_bytes(b"large attachment")
+    requested: Dict[str, Any] = {}
+
+    async def _fake_fetch(
+        attachment_id: str, *, phone: str | None, fallback_name: str
+    ) -> str:
+        requested.update(
+            id=attachment_id, phone=phone, fallback_name=fallback_name
+        )
+        return str(cached)
+
+    monkeypatch.setattr(adapter, "_fetch_attachment", _fake_fetch)
+    event = _attachment_event(
+        {
+            "id": "p:0/ATTACHMENT-GUID",
+            "name": "large.mov",
+            "mimeType": "video/quicktime",
+            "size": 30_000_000,
+        }
+    )
+    await adapter._dispatch_inbound(event)
+
+    assert requested == {
+        "id": "p:0/ATTACHMENT-GUID",
+        "phone": event["space"]["phone"],
+        "fallback_name": "large.mov",
+    }
+    assert captured[0].media_urls == [str(cached)]
+    assert captured[0].media_types == ["video/quicktime"]
 @pytest.mark.asyncio
 async def test_dispatch_attachment_downloads_image(
     monkeypatch: pytest.MonkeyPatch,

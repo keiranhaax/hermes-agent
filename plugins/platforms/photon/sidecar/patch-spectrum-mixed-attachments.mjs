@@ -18,7 +18,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const MARKER = "Hermes patch: Preserve mixed text + attachment iMessage payloads";
+const MARKER =
+  "Hermes patch: Preserve mixed text + attachment iMessage payloads";
 
 function scriptDir() {
   return path.dirname(fileURLToPath(import.meta.url));
@@ -68,14 +69,18 @@ function patchRebuild(source) {
   source = replaceOnce(
     source,
     `\t\treturn buildAttachmentMessage(client, base, info, messageGuidStr, 0);`,
-    `\t\tconst msg2 = await buildAttachmentMessage(client, base, info, text2 ? formatChildId(1, messageGuidStr) : messageGuidStr, text2 ? 1 : 0, text2 ? messageGuidStr : void 0);\n\t\tif (text2) {\n\t\t\tconst textMsg = ${textChild(3)};\n\t\t\treturn {\n\t\t\t\t...base,\n\t\t\t\tid: messageGuidStr,\n\t\t\t\tcontent: asProviderGroup([textMsg, msg2])\n\t\t\t};\n\t\t}\n\t\treturn msg2;`,
+    `\t\tconst msg2 = await buildAttachmentMessage(client, base, info, text2 ? formatChildId(1, messageGuidStr) : messageGuidStr, text2 ? 1 : 0, text2 ? messageGuidStr : void 0);\n\t\tif (text2) {\n\t\t\tconst textMsg = ${textChild(
+      3
+    )};\n\t\t\treturn {\n\t\t\t\t...base,\n\t\t\t\tid: messageGuidStr,\n\t\t\t\tcontent: asProviderGroup([textMsg, msg2])\n\t\t\t};\n\t\t}\n\t\treturn msg2;`,
     "rebuild single attachment"
   );
   // Multi attachment: prepend the text child to the group's items.
   source = replaceOnce(
     source,
     `\t\treturn {\n\t\t\t...base,\n\t\t\tid: messageGuidStr,\n\t\t\tcontent: asProviderGroup(items)\n\t\t};`,
-    `\t\tif (text2) {\n\t\t\titems.unshift(${textChild(3)});\n\t\t}\n\t\treturn {\n\t\t\t...base,\n\t\t\tid: messageGuidStr,\n\t\t\tcontent: asProviderGroup(items)\n\t\t};`,
+    `\t\tif (text2) {\n\t\t\titems.unshift(${textChild(
+      3
+    )});\n\t\t}\n\t\treturn {\n\t\t\t...base,\n\t\t\tid: messageGuidStr,\n\t\t\tcontent: asProviderGroup(items)\n\t\t};`,
     "rebuild multi attachment text child"
   );
   return source;
@@ -91,13 +96,17 @@ function patchInbound(source) {
   source = replaceOnce(
     source,
     `\t\tconst msg = await buildAttachmentMessage(client, base, info, messageGuidStr, 0);\n\t\tcacheMessage(cache, msg);\n\t\treturn [msg];`,
-    `\t\tconst msg = await buildAttachmentMessage(client, base, info, text2 ? formatChildId(1, messageGuidStr) : messageGuidStr, text2 ? 1 : 0, text2 ? messageGuidStr : void 0);\n\t\tif (text2) {\n\t\t\tconst textMsg = ${textChild(3)};\n\t\t\tconst parent = {\n\t\t\t\t...base,\n\t\t\t\tid: messageGuidStr,\n\t\t\t\tcontent: asProviderGroup([textMsg, msg])\n\t\t\t};\n\t\t\tcacheMessage(cache, parent);\n\t\t\treturn [parent];\n\t\t}\n\t\tcacheMessage(cache, msg);\n\t\treturn [msg];`,
+    `\t\tconst msg = await buildAttachmentMessage(client, base, info, text2 ? formatChildId(1, messageGuidStr) : messageGuidStr, text2 ? 1 : 0, text2 ? messageGuidStr : void 0);\n\t\tif (text2) {\n\t\t\tconst textMsg = ${textChild(
+      3
+    )};\n\t\t\tconst parent = {\n\t\t\t\t...base,\n\t\t\t\tid: messageGuidStr,\n\t\t\t\tcontent: asProviderGroup([textMsg, msg])\n\t\t\t};\n\t\t\tcacheMessage(cache, parent);\n\t\t\treturn [parent];\n\t\t}\n\t\tcacheMessage(cache, msg);\n\t\treturn [msg];`,
     "inbound single attachment"
   );
   source = replaceOnce(
     source,
     `\t\tconst parent = {\n\t\t\t...base,\n\t\t\tid: messageGuidStr,\n\t\t\tcontent: asProviderGroup(items)\n\t\t};`,
-    `\t\tif (text2) {\n\t\t\titems.unshift(${textChild(3)});\n\t\t}\n\t\tconst parent = {\n\t\t\t...base,\n\t\t\tid: messageGuidStr,\n\t\t\tcontent: asProviderGroup(items)\n\t\t};`,
+    `\t\tif (text2) {\n\t\t\titems.unshift(${textChild(
+      3
+    )});\n\t\t}\n\t\tconst parent = {\n\t\t\t...base,\n\t\t\tid: messageGuidStr,\n\t\t\tcontent: asProviderGroup(items)\n\t\t};`,
     "inbound multi attachment text child"
   );
   return source;
@@ -126,7 +135,8 @@ export function patchSpectrumTs(root = scriptDir()) {
   if (!fs.existsSync(dist)) {
     throw new Error(`@spectrum-ts/imessage dist not found: ${dist}`);
   }
-  const files = fs.readdirSync(dist)
+  const files = fs
+    .readdirSync(dist)
     .filter((name) => name.endsWith(".js"))
     .map((name) => path.join(dist, name));
 
@@ -144,8 +154,18 @@ export function patchSpectrumTs(root = scriptDir()) {
     const CRLF = CR + "\n";
     const usedCRLF = raw.includes(CRLF);
     const original = usedCRLF ? raw.split(CRLF).join("\n") : raw;
-    if (!original.includes("const toInboundMessages = async") ||
-        !original.includes("const rebuildFromAppleMessage = async")) {
+    // spectrum-ts >= 8.2 preserves ordered text+attachment parts upstream.
+    // Treat that shape as a clean no-op instead of failing the sidecar install.
+    if (
+      original.includes("toOrderedParts(message.content.text, attachments)") &&
+      original.includes("buildOrderedPartMessage")
+    ) {
+      return { patched: false, file, reason: "fixed upstream" };
+    }
+    if (
+      !original.includes("const toInboundMessages = async") ||
+      !original.includes("const rebuildFromAppleMessage = async")
+    ) {
       continue;
     }
     let patched = original;
@@ -159,20 +179,27 @@ export function patchSpectrumTs(root = scriptDir()) {
     fs.writeFileSync(file, patched, "utf8");
     return { patched: true, file };
   }
-  throw new Error("could not find @spectrum-ts/imessage iMessage inbound chunk to patch");
+  throw new Error(
+    "could not find @spectrum-ts/imessage iMessage inbound chunk to patch"
+  );
 }
 
 const _invokedDirectly =
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(process.argv[1]).href;
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (_invokedDirectly) {
   try {
     const root = process.argv[2] ? path.resolve(process.argv[2]) : scriptDir();
     const result = patchSpectrumTs(root);
     const action = result.patched ? "patched" : "ok";
-    console.error(`photon-sidecar: spectrum mixed attachment patch ${action}: ${result.file}`);
+    console.error(
+      `photon-sidecar: spectrum mixed attachment patch ${action}: ${result.file}`
+    );
   } catch (err) {
-    console.error(`photon-sidecar: spectrum mixed attachment patch failed: ${err?.stack || err}`);
+    console.error(
+      `photon-sidecar: spectrum mixed attachment patch failed: ${
+        err?.stack || err
+      }`
+    );
     process.exit(1);
   }
 }

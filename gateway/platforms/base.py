@@ -3327,6 +3327,10 @@ class BasePlatformAdapter(ABC):
     # property) so the stream consumer knows not to short-circuit.
     REQUIRES_EDIT_FINALIZE: bool = False
 
+    # Optional platform limit for edit-based streaming. The consumer reserves
+    # one edit for the final frame and coalesces excess interim updates.
+    MAX_STREAMING_EDITS_PER_MESSAGE: Optional[int] = None
+
     async def create_handoff_thread(
         self,
         parent_chat_id: str,

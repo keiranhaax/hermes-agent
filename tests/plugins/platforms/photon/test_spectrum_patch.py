@@ -198,6 +198,32 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     assert chunk.read_text(encoding="utf-8") == patched
 
 
+def test_spectrum_patch_accepts_upstream_ordered_parts_fix(tmp_path: Path) -> None:
+    dist = tmp_path / "node_modules" / "@spectrum-ts" / "imessage" / "dist"
+    dist.mkdir(parents=True)
+    chunk = dist / "index.js"
+    original = (
+        "const buildOrderedPartMessage = async () => {};\n"
+        "const rebuildFromAppleMessage = async () => {\n"
+        "  const parts = toOrderedParts(message.content.text, attachments);\n"
+        "};\n"
+        "const toInboundMessages = async () => {};\n"
+    )
+    chunk.write_text(original, encoding="utf-8")
+
+    result = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stderr
+    assert chunk.read_text(encoding="utf-8") == original
+
+
 def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
     """Execute the patched mappers and assert mixed bubbles become groups whose
     first child is the typed text, while text-free bubbles keep their exact

@@ -21,9 +21,12 @@ Two invariants:
 from __future__ import annotations
 
 import io
+import os
 import re
+import subprocess
 import sys
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -32,6 +35,7 @@ from hermes_cli.main import (
     _BUILTIN_SUBCOMMANDS,
     _first_positional_argv,
     _plugin_cli_discovery_needed,
+    _resolve_deferred_plugin_cli_target,
 )
 
 
@@ -139,6 +143,37 @@ def test_discovery_skipped_for_builtins(argv):
 def test_discovery_runs_for_unknown_positional(argv):
     with patch.object(sys, "argv", argv):
         assert _plugin_cli_discovery_needed() is True
+
+
+def test_deferred_platform_cli_resolution_loads_only_invoked_target():
+    from gateway.platform_registry import platform_registry
+
+    with patch.object(sys, "argv", ["hermes", "photon", "status"]):
+        with patch.object(platform_registry, "get") as get_platform:
+            _resolve_deferred_plugin_cli_target()
+
+    get_platform.assert_called_once_with("photon")
+
+
+def test_photon_help_resolves_through_real_cli(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - photon-platform\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "photon", "--help"],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "usage: hermes photon" in result.stdout
 
 
 # ── _BUILTIN_SUBCOMMANDS ↔ argparse registration parity ────────────────────

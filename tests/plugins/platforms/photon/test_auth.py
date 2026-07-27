@@ -572,3 +572,38 @@ def test_login_device_flow_raises_when_token_invalid(
         photon_auth.login_device_flow(open_browser=False)
     # A token that failed validation must never be persisted.
     assert photon_auth.load_photon_token() is None
+
+
+def test_project_diagnostics_return_only_safe_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        assert kwargs.get("headers", {}).get("Authorization", "").startswith("Basic ")
+        if url.endswith("/billing/subscription"):
+            return _FakeResponse(
+                json_body={
+                    "succeed": True,
+                    "data": {
+                        "tier": "free",
+                        "status": "active",
+                        "cancel_at_period_end": False,
+                        "subscription_id": "must-not-leak",
+                        "customer_id": "must-not-leak",
+                    },
+                }
+            )
+        assert url.endswith("/imessage/")
+        return _FakeResponse(
+            json_body={"succeed": True, "data": {"type": "shared"}}
+        )
+
+    monkeypatch.setattr(photon_auth.httpx, "get", fake_get)
+
+    assert photon_auth.get_subscription_details("project", "secret") == {
+        "tier": "free",
+        "status": "active",
+        "cancel_at_period_end": False,
+    }
+    assert photon_auth.get_imessage_service_info("project", "secret") == {
+        "type": "shared"
+    }

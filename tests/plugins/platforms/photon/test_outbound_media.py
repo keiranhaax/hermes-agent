@@ -253,3 +253,28 @@ async def test_standalone_send_text_then_attachments(
     assert posted[1][1]["path"] == str(img)
     assert posted[1][1]["kind"] == "attachment"
     assert posted[1][1]["mimeType"] == "image/png"
+
+
+def test_standalone_sidecar_errors_ignore_raw_legacy_text() -> None:
+    structured = photon_adapter._standalone_sidecar_failure(
+        503,
+        {
+            "error": {
+                "code": "upstream_unavailable",
+                "message": "Photon is temporarily unavailable.",
+                "retryable": True,
+            }
+        },
+    )
+    assert structured == {
+        "error": "Photon is temporarily unavailable.",
+        "error_code": "upstream_unavailable",
+        "retryable": True,
+    }
+
+    private_path = "/home/alice/private-file.jpg"
+    legacy = photon_adapter._standalone_sidecar_failure(
+        500, {"error": f"provider stack referenced {private_path}"}
+    )
+    assert legacy["error"] == "Photon sidecar returned HTTP 500."
+    assert private_path not in legacy["error"]
